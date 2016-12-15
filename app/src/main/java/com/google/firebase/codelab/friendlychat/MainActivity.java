@@ -40,9 +40,16 @@ import android.widget.Toast;
 
 import com.bumptech.glide.Glide;
 import com.firebase.ui.database.FirebaseRecyclerAdapter;
+import com.google.android.gms.ads.AdRequest;
+import com.google.android.gms.ads.AdView;
+import com.google.android.gms.appinvite.AppInvite;
+import com.google.android.gms.appinvite.AppInviteInvitation;
 import com.google.android.gms.auth.api.Auth;
 import com.google.android.gms.common.ConnectionResult;
 import com.google.android.gms.common.api.GoogleApiClient;
+import com.google.android.gms.tasks.OnFailureListener;
+import com.google.android.gms.tasks.OnSuccessListener;
+import com.google.firebase.analytics.FirebaseAnalytics;
 import com.google.firebase.appindexing.Action;
 import com.google.firebase.appindexing.FirebaseAppIndex;
 import com.google.firebase.appindexing.FirebaseUserActions;
@@ -51,6 +58,7 @@ import com.google.firebase.appindexing.builders.Indexables;
 import com.google.firebase.appindexing.builders.PersonBuilder;
 import com.google.firebase.auth.FirebaseAuth;
 import com.google.firebase.auth.FirebaseUser;
+import com.google.firebase.crash.FirebaseCrash;
 import com.google.firebase.database.DataSnapshot;
 import com.google.firebase.database.DatabaseReference;
 import com.google.firebase.database.FirebaseDatabase;
@@ -97,11 +105,13 @@ public class MainActivity extends AppCompatActivity
     private EditText mMessageEditText;
     private FirebaseAuth mFirebaseAuth;
     private FirebaseUser mFirebaseUser;
+    private AdView mAdview;
 
     // Firebase instance variables
     private DatabaseReference mFirebaseDatabaseReference;
     private FirebaseRecyclerAdapter<FriendlyMessage, MessageViewHolder> mFirebaseAdapter;
     private FirebaseRemoteConfig mFirebaseRemoteConfig;
+    private FirebaseAnalytics mFirebaseAnalytics;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -126,6 +136,7 @@ public class MainActivity extends AppCompatActivity
         mGoogleApiClient = new GoogleApiClient.Builder(this)
                 .enableAutoManage(this /* FragmentActivity */, this /* OnConnectionFailedListener */)
                 .addApi(Auth.GOOGLE_SIGN_IN_API)
+                .addApi(AppInvite.API)
                 .build();
 
         mFirebaseRemoteConfig = FirebaseRemoteConfig.getInstance();
@@ -223,6 +234,12 @@ public class MainActivity extends AppCompatActivity
                 mMessageEditText.setText("");
             }
         });
+
+        mFirebaseAnalytics = FirebaseAnalytics.getInstance(this);
+
+        mAdview = (AdView) findViewById(R.id.adView);
+        AdRequest adRequest = new AdRequest.Builder().build();
+        mAdview.loadAd(adRequest);
     }
 
     @Override
@@ -234,16 +251,25 @@ public class MainActivity extends AppCompatActivity
 
     @Override
     public void onPause() {
+        if(mAdview!=null){
+            mAdview.pause();
+        }
         super.onPause();
     }
 
     @Override
     public void onResume() {
         super.onResume();
+        if(mAdview!=null){
+            mAdview.resume();
+        }
     }
 
     @Override
     public void onDestroy() {
+        if(mAdview!=null){
+            mAdview.destroy();
+        }
         super.onDestroy();
     }
 
@@ -257,6 +283,16 @@ public class MainActivity extends AppCompatActivity
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
         switch (item.getItemId()){
+            case R.id.crash_menu:
+                FirebaseCrash.logcat(Log.ERROR, TAG, "crash caused");
+                causeCrash();
+                return true;
+            case R.id.invite_menu:
+                sendInvitation();
+                return true;
+            case R.id.fresh_config_menu:
+                fetchConfig();
+                return true;
             case R.id.sign_out_menu:
                 mFirebaseAuth.signOut();
                 Auth.GoogleSignInApi.signOut(mGoogleApiClient);
@@ -278,7 +314,7 @@ public class MainActivity extends AppCompatActivity
 
     private Indexable getMessageIndexable(FriendlyMessage friendlyMessage){
         PersonBuilder sender = Indexables.personBuilder()
-                .setIsSelf(mUsername == friendlyMessage.getName())
+                .setIsSelf(mUsername.equals(friendlyMessage.getName()))
                 .setName(friendlyMessage.getName())
                 .setUrl(MESSAGE_URL.concat(friendlyMessage.getId() + "/sender"));
 
@@ -299,5 +335,68 @@ public class MainActivity extends AppCompatActivity
                 .setObject(friendlyMessage.getName(),MESSAGE_URL.concat(friendlyMessage.getId()))
                 .setMetadata(new Action.Metadata.Builder().setUpload(false))
                 .build();
+    }
+
+    public void fetchConfig(){
+        long cacheExpiration = 36000;
+        if(mFirebaseRemoteConfig.getInfo().getConfigSettings().isDeveloperModeEnabled()){
+            cacheExpiration = 0;
+        }
+        mFirebaseRemoteConfig.fetch(cacheExpiration)
+                .addOnSuccessListener(new OnSuccessListener<Void>() {
+                    @Override
+                    public void onSuccess(Void aVoid) {
+                        mFirebaseRemoteConfig.activateFetched();
+                        applyRetrievedLengthLimit();
+                    }
+                })
+                .addOnFailureListener(new OnFailureListener() {
+                    @Override
+                    public void onFailure(@NonNull Exception e) {
+                        Log.w(TAG,"Error fetching config: " + e.getMessage());
+                        applyRetrievedLengthLimit();
+                    }
+                });
+    }
+
+    private void applyRetrievedLengthLimit(){
+        Long friendly_msg_length = mFirebaseRemoteConfig.getLong("friendly_msg_length");
+        mMessageEditText.setFilters(new InputFilter[]{
+                new InputFilter.LengthFilter(friendly_msg_length.intValue())
+        });
+        Log.d(TAG,"FML is: " + friendly_msg_length);
+    }
+
+    private void sendInvitation(){
+        Intent intent = new AppInviteInvitation.IntentBuilder(getString(R.string.invitation_title))
+                .setMessage(getString(R.string.invitation_message))
+                .setCallToActionText(getString(R.string.invitation_cta))
+                .build();
+        startActivityForResult(intent,REQUEST_INVITE);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        Log.d(TAG,"onActivityResult: requestCode=" + requestCode + ", resultCode=" + resultCode);
+
+        if(requestCode == REQUEST_INVITE) {
+            if(resultCode == RESULT_OK){
+                Bundle payload = new Bundle();
+                payload.putString(FirebaseAnalytics.Param.VALUE,"sent");
+                mFirebaseAnalytics.logEvent(FirebaseAnalytics.Event.SHARE,payload);
+               String[] ids = AppInviteInvitation.getInvitationIds(resultCode,data);
+                Log.d(TAG, "Invitations sent: " + ids.length);
+            }else{
+                Bundle payload = new Bundle();
+                payload.putString(FirebaseAnalytics.Param.VALUE,"not sent");
+                mFirebaseAnalytics.logEvent(FirebaseAnalytics.Event.SHARE, payload);
+                Log.d(TAG, "Failed to send invitation.");
+            }
+        }
+    }
+
+    private void causeCrash(){
+        throw new NullPointerException("Fake null pointer exception");
     }
 }
